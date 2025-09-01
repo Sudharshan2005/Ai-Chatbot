@@ -1,0 +1,10 @@
+Flask
+pika
+tenacity
+pymongo
+redis
+python-dotenv
+scikit-learn
+numpy
+google-generativeai
+joblib
