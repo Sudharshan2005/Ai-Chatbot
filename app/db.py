@@ -52,7 +52,12 @@ def get_messages_by_case_ids(case_ids):
     return [serialize_doc(d) for d in docs]
 
 def get_user_session_ids(user_id):
-    return list(messages.distinct("session_id", {"user_id": user_id}))
+    sessions_list = sessions.find({"user_id": user_id}, {"session_id": 1, "_id": 0})
+    return [session["session_id"] for session in sessions_list]
 
 def get_messages_by_ids(message_ids):
-    return list(messages.find({"_id": {"$in": [ObjectId(mid) for mid in message_ids]}}).sort("timestamp", 1))
+    return list(
+        messages.find(
+            {"message_id": {"$in": message_ids}}
+        ).sort("timestamp", 1)
+    )
