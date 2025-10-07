@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
 import traceback
+from sentence_transformers import SentenceTransformer, util
 
 load_dotenv()
 df, X, embedding_model = joblib.load("../../chatbot.pkl")
@@ -22,6 +23,7 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "test-secret")
 CORS(app, resources={r"/*": {"origins": ["http://localhost:3000"]}}, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000"], cors_credentials=True, logger=True, engineio_logger=True)
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
 class CaseMemory:
     def __init__(self, initial_memory=None):
@@ -168,6 +170,17 @@ def chat():
         prompt = f"You are a helpful and friendly customer support chatbot. Your goal is to provide clear, concise, and accurate responses to user inquiries. Keep your answers short to medium in length. Your tone should be warm, empathetic, and non-judgmental. Here's the conversation so far: {ctx} New user message: {user_message} Craft a helpful response that addresses the user's message directly. Ensure your response is easy to understand and maintains a consistent, supportive tone."
         resp_text = bot.generate_content(prompt).text.strip()
         memory.add_interaction(user_message, resp_text, intent)
+        try:
+            query_emb = model.encode([user_message], convert_to_tensor=True)
+            answer_emb = model.encode([resp_text], convert_to_tensor=True)
+            sim = float(util.cos_sim(query_emb, answer_emb).item())
+        except Exception as e:
+            print("Similarity computation failed:", e)
+            sim = 0.3
+        if sim >= 0.5:
+            similarity_score = sim
+        else:
+            similarity_score = sim * 0.8
         latency_ms = round((time.perf_counter() - t0) * 1000)
         doc = {
             "org_id": org_id, "user_id": user_id, "channel": channel,
@@ -175,7 +188,7 @@ def chat():
             "parent_message_id": None, "request_id": request_id, "direction": "inbound",
             "user_message": user_message, "response": resp_text, "source": "gemini", "status": "open",
             "nlu": {"intent": intent, "intent_confidence": intent_confidence, "language": "en", "sentiment": "neutral", "tone": "neutral"},
-            "retrieval": {"kb_id": "default", "top_k_doc_ids": [], "answer_confidence": None, "similarity_score": None},
+            "retrieval": {"kb_id": "default", "top_k_doc_ids": [], "answer_confidence": similarity_score, "similarity_score": similarity_score},
             "llm": {"model": "gemini-2.5-flash", "latency_ms": latency_ms, "prompt_tokens": None, "completion_tokens": None},
             "ticket": {"escalated": False, "ticket_id": None, "resolution_code": None},
             "feedback": {"user_rating": None, "user_comment": None},
