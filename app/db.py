@@ -1,5 +1,6 @@
 from pymongo import MongoClient
 import datetime
+from bson import ObjectId
 
 MONGODB_URI = "mongodb+srv://GoPredict:5vvgj23hbz@cluster0.uxpju.mongodb.net/Chatbot?retryWrites=true&w=majority"
 client = MongoClient(MONGODB_URI)
@@ -49,3 +50,9 @@ def get_messages_by_case_ids(case_ids):
     """Fetch messages by case_ids sorted by timestamp"""
     docs = list(messages.find({"case_id": {"$in": case_ids}}).sort("timestamp", 1))
     return [serialize_doc(d) for d in docs]
+
+def get_user_session_ids(user_id):
+    return list(messages.distinct("session_id", {"user_id": user_id}))
+
+def get_messages_by_ids(message_ids):
+    return list(messages.find({"_id": {"$in": [ObjectId(mid) for mid in message_ids]}}).sort("timestamp", 1))

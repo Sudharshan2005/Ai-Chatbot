@@ -3,16 +3,18 @@ import joblib, os, time, datetime, pickle
 import google.generativeai as genai
 from sklearn.metrics.pairwise import cosine_similarity
 from uuid import uuid4
-from db import save_message, get_case_memory, get_session_case_ids, get_messages_by_case_ids, serialize_doc
+from db import save_message, get_case_memory, get_session_case_ids, get_messages_by_case_ids, serialize_doc, get_user_session_ids, get_messages_by_ids, sessions
 from redis_utils import load_redis_memory, save_redis_memory, clear_redis_memory
 from mq import setup_topology, publish_event
 from dotenv import load_dotenv
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
+import jwt
 
 
 load_dotenv()
-df, X, embedding_model = joblib.load("/Users/sudharshan/Documents/PS-G538/chatbot.pkl")
+# df, X, embedding_model = joblib.load("/Users/sudharshan/Documents/PS-G538/chatbot.pkl")
+df, X, embedding_model = joblib.load("../../chatbot.pkl")
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 bot = genai.GenerativeModel(model_name='models/gemini-2.5-flash')
@@ -62,9 +64,54 @@ socketio = SocketIO(
     app,
     cors_allowed_origins="*"
 )
+JWT_SECRET = os.getenv("JWT_SECRET", "5vvgj23hbz")
+def verify_jwt(token):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return payload["user_id"]
+    except jwt.InvalidTokenError:
+        return None
+
+@app.route("/user", methods=["GET", "PATCH"])
+def user_profile():
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid token"}), 401
+    token = auth_header.split(" ")[1]
+    user_id = verify_jwt(token)
+    if not user_id:
+        return jsonify({"error": "Invalid token"}), 401
+
+    if request.method == "GET":
+        user = {
+            "id": user_id,
+            "name": "User",
+            "email": f"{user_id}@example.com",
+            "initials": "U"
+        }
+        return jsonify({"user": user})
+
+    if request.method == "PATCH":
+        data = request.json or {}
+        updated_user = {
+            "id": user_id,
+            "name": data.get("name", "User"),
+            "email": data.get("email", f"{user_id}@example.com"),
+            "initials": data.get("name", "User")[0].upper()
+        }
+        return jsonify({"user": updated_user})
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid token"}), 401
+    token = auth_header.split(" ")[1]
+    user_id = verify_jwt(token)
+    if not user_id:
+        return jsonify({"error": "Invalid token"}), 401
+
     data = request.json or {}
     user_message = data.get("message", "")
     session_id = data.get("session_id") or str(uuid4())
@@ -75,6 +122,13 @@ def chat():
     case_id = str(uuid4())
     message_id = str(uuid4())
     t0 = time.perf_counter()
+
+    print(f"Received message for session_id: {session_id}, message: {user_message}")
+    sessions.update_one(
+        {"session_id": session_id, "user_id": user_id},
+        {"$push": {"message_ids": message_id}, "$setOnInsert": {"user_id": user_id}},
+        upsert=True
+    )
 
     memory = load_redis_memory(user_id, session_id)
     if not memory:
@@ -172,6 +226,7 @@ def chat():
         body=serialize_doc(doc),
         headers={"type": "message.received", "x-attempt": 0}
     )
+    print(f"Sending response for session_id: {session_id}, response: {doc['response']}")
     socketio.emit("message:ack", serialize_doc(doc), room=session_id)
     return jsonify(serialize_doc(doc))
 
@@ -185,6 +240,29 @@ def end_session():
     clear_redis_memory(session_id)
     return jsonify({"message": f"Session {session_id} cleared from Redis"})
 
+@app.route("/user/sessions", methods=["GET"])
+def get_user_sessions():
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return jsonify({"error": "Missing or invalid token"}), 401
+    token = auth_header.split(" ")[1]
+    user_id = verify_jwt(token)
+    if not user_id:
+        return jsonify({"error": "Invalid token"}), 401
+
+    # Get session IDs from sessions collection
+    session_ids = get_user_session_ids(user_id)
+    historical_chats = {}
+    for session_id in session_ids:
+        session = sessions.find_one({"session_id": session_id, "user_id": user_id})
+        if session and "message_ids" in session:
+            message_ids = session["message_ids"]
+            messages = get_messages_by_ids(message_ids)
+            historical_chats[session_id] = [serialize_doc(m) for m in messages]
+        else:
+            historical_chats[session_id] = []
+
+    return jsonify({"historical_chats": historical_chats})
 
 @app.route("/")
 def index():
