@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import google.generativeai as genai
 from sklearn.metrics.pairwise import cosine_similarity
 from uuid import uuid4
-from db import save_message, get_session_case_ids, get_messages_by_case_ids, serialize_doc, get_user_session_ids, get_messages_by_ids, sessions, get_message_by_id
+from db import save_message, get_session_case_ids, get_messages_by_case_ids, serialize_doc, get_user_session_ids, get_messages_by_ids, sessions, agents, messages, get_message_by_id
 from redis_utils import load_redis_memory, save_redis_memory, clear_redis_memory
 from mq import setup_topology, publish_event
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
 import traceback
 from sentence_transformers import SentenceTransformer, util
+from supabase import create_client
 
 load_dotenv()
 df, X, embedding_model = joblib.load("../../chatbot.pkl")
@@ -24,6 +25,25 @@ app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "test-secret")
 CORS(app, resources={r"/*": {"origins": ["http://localhost:3000"]}}, supports_credentials=True)
 socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000"], cors_credentials=True, logger=True, engineio_logger=True)
 model = SentenceTransformer("all-MiniLM-L6-v2")
+
+def parse_timestamp(ts):
+    """Convert datetime, dict, or ISO string to milliseconds"""
+    if ts is None:
+        return int(datetime.utcnow().timestamp() * 1000)
+    if isinstance(ts, dict):
+        # MongoDB extended JSON format
+        if '$date' in ts:
+            ts_val = ts['$date']
+            if isinstance(ts_val, dict) and '$numberLong' in ts_val:
+                return int(ts_val['$numberLong'])
+            else:
+                ts = ts_val
+    if isinstance(ts, datetime):
+        return int(ts.timestamp() * 1000)
+    if isinstance(ts, str):
+        return int(datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() * 1000)
+    return int(datetime.utcnow().timestamp() * 1000)
+
 
 class CaseMemory:
     def __init__(self, initial_memory=None):
@@ -284,6 +304,190 @@ def get_message(message_id):
         else:
             return jsonify({'error': 'Message not found'}), 404
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/agents', methods=['GET'])
+def get_agents():
+    try:
+        agents_list = list(agents.find({}))
+        for agent in agents_list:
+            agent['_id'] = str(agent['_id'])
+        return jsonify({'agents': agents_list})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/agent/assign-session', methods=['POST'])
+def assign_session_to_agent():
+    try:
+        data = request.get_json()
+        agent_id = data.get('agent_id')
+        session_id = data.get('session_id')
+        
+        result = agents.update_one(
+            {'user_id': agent_id},
+            {
+                '$addToSet': {'current_sessions': session_id},
+                '$set': {'updated_at': datetime.utcnow()}
+            }
+        )
+        
+        if result.modified_count:
+            return jsonify({'success': True, 'message': 'Session assigned'})
+        else:
+            return jsonify({'error': 'Agent not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/agent/remove-session', methods=['POST'])
+def remove_session_from_agent():
+    try:
+        data = request.get_json()
+        agent_id = data.get('agent_id')
+        session_id = data.get('session_id')
+        
+        # Remove session from agent's current_sessions
+        result = agents.update_one(
+            {'user_id': agent_id},
+            {
+                '$pull': {'current_sessions': session_id},
+                '$set': {'updated_at': datetime.utcnow()}
+            }
+        )
+        
+        return jsonify({'success': True, 'message': 'Session removed'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/agent/sessions', methods=['GET'])
+def get_agent_sessions():
+    try:
+        agent_id = request.args.get('agent_id')
+        
+        if not agent_id:
+            return jsonify({'error': 'agent_id is required'}), 400
+        
+        # Get agent to find their sessions
+        agent = agents.find_one({'user_id': agent_id})
+        if not agent:
+            return jsonify({'message': 'No Agent Found' ,'sessions': []})
+        
+        # Get tickets assigned to this agent from Supabase
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_KEY')
+        
+        supabase_client = create_client(supabase_url, supabase_key)
+        
+        # Get all tickets assigned to this agent
+        tickets_response = supabase_client.table('tickets') \
+            .select('*') \
+            .eq('escalatedTo', agent_id) \
+            .execute()
+        
+        tickets = tickets_response.data if tickets_response.data else []
+        
+        sessions_data = []
+        
+        for ticket in tickets:
+            session_id = ticket.get('sessionId')
+            if not session_id:
+                continue
+                
+            # Get session from MongoDB
+            session = sessions.find_one({'session_id': session_id})
+            if not session:
+                continue
+            
+            # Get messages for this session
+            messages_list = list(messages.find({'session_id': session_id}))
+            
+            # Process messages
+            processed_messages = []
+            for msg in messages_list:
+                # Add user message
+                if msg.get('user_message'):
+                    processed_messages.append({
+                        'id': msg.get('message_id'),
+                        'role': 'user',
+                        'content': msg.get('user_message'),
+                        'createdAt': msg.get('timestamp')
+                    })
+                
+                # Add assistant response
+                if msg.get('response'):
+                    processed_messages.append({
+                        'id': f"{msg.get('message_id')}-response",
+                        'role': 'assistant',
+                        'content': msg.get('response'),
+                        'createdAt': msg.get('timestamp')
+                    })
+            
+            # Sort messages by timestamp
+            processed_messages.sort(key=lambda x: x['createdAt'])
+            
+            # Determine title from first user message
+            title = "Untitled Session"
+            for msg in processed_messages:
+                if msg['role'] == 'user':
+                    user_message = msg['content']
+                    title = user_message[:50] + "..." if len(user_message) > 50 else user_message
+                    break
+            
+            # Get user info
+            user_email = ticket.get('userId') or session.get('user_id')
+            user_name = ticket.get('userName')
+            
+            # Create session object
+            session_data = {
+                'id': session_id,
+                'title': title,
+                'status': 'active' if ticket.get('isActive') else 'resolved',
+                'priority': ticket.get('priority', 'low'),
+                'assignee': ticket.get('escalatedTo'),
+                'assigneeName': agent.get('name'),
+                'userName': user_name,
+                'userEmail': user_email,
+                'tags': ticket.get('tags', []),
+                'messages': processed_messages,
+                'createdAt': parse_timestamp(session.get('last_updated')),
+                'updatedAt': parse_timestamp(ticket.get('updatedAt') or session.get('last_updated')),
+                'closedAt': None if ticket.get('isActive') else parse_timestamp(ticket.get('updatedAt') or session.get('last_updated'))
+            }
+            
+            # Convert timestamps to milliseconds
+            try:
+                if session_data['createdAt']:
+                    if isinstance(session_data['createdAt'], dict) and '$numberLong' in session_data['createdAt']:
+                        session_data['createdAt'] = int(session_data['createdAt']['$numberLong'])
+                    else:
+                        session_data['createdAt'] = int(datetime.fromisoformat(session_data['createdAt'].replace('Z', '+00:00')).timestamp() * 1000)
+                
+                if session_data['updatedAt']:
+                    if isinstance(session_data['updatedAt'], dict) and '$numberLong' in session_data['updatedAt']:
+                        session_data['updatedAt'] = int(session_data['updatedAt']['$numberLong'])
+                    else:
+                        session_data['updatedAt'] = int(datetime.fromisoformat(session_data['updatedAt'].replace('Z', '+00:00')).timestamp() * 1000)
+                
+                if session_data['closedAt']:
+                    if isinstance(session_data['closedAt'], dict) and '$numberLong' in session_data['closedAt']:
+                        session_data['closedAt'] = int(session_data['closedAt']['$numberLong'])
+                    else:
+                        session_data['closedAt'] = int(datetime.fromisoformat(session_data['closedAt'].replace('Z', '+00:00')).timestamp() * 1000)
+            except (ValueError, AttributeError) as e:
+                print(f"Error parsing timestamps for session {session_id}: {e}")
+                # Set fallback timestamps
+                current_time = int(datetime.utcnow().timestamp() * 1000)
+                session_data['createdAt'] = session_data.get('createdAt') or current_time
+                session_data['updatedAt'] = session_data.get('updatedAt') or current_time
+            
+            sessions_data.append(session_data)
+        
+        return jsonify({'sessions': sessions_data})
+        
+    except Exception as e:
+        print(f"Error in get_agent_sessions: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 

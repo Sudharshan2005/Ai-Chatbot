@@ -8,6 +8,7 @@ client = MongoClient(MONGODB_URI)
 db = client.Chatbot
 messages = db["messages"]
 sessions = db["sessions"]
+agents = db["agents"]
 
 def serialize_doc(doc):
     doc = dict(doc)
