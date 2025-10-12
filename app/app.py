@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import google.generativeai as genai
 from sklearn.metrics.pairwise import cosine_similarity
 from uuid import uuid4
-from db import save_message, get_session_case_ids, get_messages_by_case_ids, serialize_doc, get_user_session_ids, get_messages_by_ids, sessions
+from db import save_message, get_session_case_ids, get_messages_by_case_ids, serialize_doc, get_user_session_ids, get_messages_by_ids, sessions, get_message_by_id
 from redis_utils import load_redis_memory, save_redis_memory, clear_redis_memory
 from mq import setup_topology, publish_event
 from dotenv import load_dotenv
@@ -86,9 +86,16 @@ def chat():
         # Save message_id to sessions collection
         sessions.update_one(
             {"session_id": session_id, "user_id": user_id},
-            {"$push": {"message_ids": message_id}, "$setOnInsert": {"user_id": user_id}},
+            {
+                "$push": {"message_ids": message_id},
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "isActive": True
+                }
+            },
             upsert=True
         )
+
 
         # Load memory from Redis
         memory_data = load_redis_memory(user_id, session_id)
@@ -218,6 +225,10 @@ def end_session():
             return jsonify({"error": "session_id and user_id required"}), 400
 
         clear_redis_memory(session_id)
+        sessions.update_one(
+            {"session_id": session_id, "user_id": user_id},
+            {"$set": {"isActive": False}}
+        )
         return jsonify({"message": f"Session {session_id} cleared from Redis"})
     except Exception as e:
         print("Error in /end_session:", str(e))
@@ -247,6 +258,34 @@ def get_user_sessions():
         print("Error in /user/sessions:", str(e))
         print(traceback.format_exc())
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
+    
+@app.route('/admin/sessions', methods=['GET'])
+def get_all_sessions():
+    try:
+        # Fetch all session documents from MongoDB
+        all_sessions = list(sessions.find())
+
+        # Serialize each document (convert ObjectId to str)
+        serialized_sessions = [serialize_doc(session) for session in all_sessions]
+
+        return jsonify({'sessions': serialized_sessions}), 200
+
+    except Exception as e:
+        print("Error in /admin/sessions:", str(e))
+        return jsonify({'error': 'Internal server error', 'details': str(e)}), 500
+
+@app.route('/admin/message/<message_id>', methods=['GET'])
+def get_message(message_id):
+    try:
+        message = get_message_by_id(message_id)
+        if message:
+            message['_id'] = str(message['_id'])
+            return jsonify(message)
+        else:
+            return jsonify({'error': 'Message not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route("/")
 def index():

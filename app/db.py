@@ -61,3 +61,7 @@ def get_messages_by_ids(message_ids):
             {"message_id": {"$in": message_ids}}
         ).sort("timestamp", 1)
     )
+
+def get_message_by_id(message_id):
+    """Fetch a single message by its message_id"""
+    return messages.find_one({"message_id": message_id})
