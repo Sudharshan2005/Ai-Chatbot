@@ -103,6 +103,18 @@ def chat():
 
         print(f"Received message for session_id: {session_id}, user_id: {user_id}, message: {user_message}")
 
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_KEY')
+        supabase_client = create_client(supabase_url, supabase_key)
+        
+        ticket_response = supabase_client.table('tickets') \
+            .select('*') \
+            .eq('sessionId', session_id) \
+            .execute()
+        
+        ticket = ticket_response.data[0] if ticket_response.data else None
+        is_assigned_to_agent = ticket and ticket.get('escalatedTo') and ticket.get('isActive')
+
         # Save message_id to sessions collection
         sessions.update_one(
             {"session_id": session_id, "user_id": user_id},
@@ -116,6 +128,44 @@ def chat():
             upsert=True
         )
 
+        if is_assigned_to_agent:
+            agent_id = ticket.get('escalatedTo')
+            
+            # Save user message
+            user_message_doc = {
+                "org_id": org_id, "user_id": user_id, "channel": channel,
+                "session_id": session_id, "case_id": case_id, "message_id": message_id,
+                "parent_message_id": None, "request_id": request_id, "direction": "inbound",
+                "user_message": user_message, "response": None, "source": "user",
+                "status": "open",
+                "nlu": {"intent": "user_to_agent", "intent_confidence": 1.0, "language": "en", "sentiment": "neutral", "tone": "neutral"},
+                "retrieval": {"kb_id": "default", "top_k_doc_ids": [], "answer_confidence": 1.0, "similarity_score": 1.0},
+                "llm": {"model": None, "latency_ms": 0, "prompt_tokens": None, "completion_tokens": None},
+                "ticket": {"escalated": True, "ticket_id": None, "resolution_code": None},
+                "feedback": {"user_rating": None, "user_comment": None},
+                "security": {"pii_redacted": True, "pii_types": []},
+                "waiting_for_agent_response": True,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            
+            save_message(user_message_doc)
+            
+            # Emit to Socket.IO for real-time updates
+            socketio.emit("user_message", serialize_doc(user_message_doc), room=session_id)
+            # Notify the assigned agent
+            socketio.emit("new_user_message", serialize_doc(user_message_doc), room=f"agent_{agent_id}")
+            
+            publish_event(
+                body=serialize_doc(user_message_doc),
+                headers={"type": "user.message.to.agent", "x-attempt": 0}
+            )
+            
+            return jsonify({
+                "message": "Message forwarded to agent",
+                "assigned_agent": agent_id,
+                "user_message": user_message,
+                "session_id": session_id
+            })
 
         # Load memory from Redis
         memory_data = load_redis_memory(user_id, session_id)
@@ -490,6 +540,125 @@ def get_agent_sessions():
         print(f"Error in get_agent_sessions: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route("/agent/chat", methods=["POST"])
+def agent_chat():
+    try:
+        data = request.json or {}
+        agent_id = data.get("agent_id")
+        user_message = data.get("message", "")
+        session_id = data.get("session_id")
+        
+        if not agent_id or not session_id:
+            return jsonify({"error": "agent_id and session_id are required"}), 400
+        
+        # Verify agent has access to this session
+        agent = agents.find_one({'user_id': agent_id})
+        if not agent or session_id not in agent.get('current_sessions', []):
+            return jsonify({"error": "Agent not assigned to this session"}), 403
+        
+        # Verify session exists and is active
+        session = sessions.find_one({'session_id': session_id})
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+        
+        # Get the latest user message that's waiting for agent response
+        latest_user_message = messages.find_one({
+            'session_id': session_id,
+            'waiting_for_agent_response': True
+        }, sort=[('timestamp', -1)])  # Get the most recent one
+        
+        if not latest_user_message:
+            return jsonify({"error": "No user message found waiting for response"}), 404
+        
+        # Update the existing document with agent's response
+        update_data = {
+            "response": user_message,
+            "source": "agent",
+            "status": "resolved",
+            "waiting_for_agent_response": False,  # Remove the flag
+            "agent_id": agent_id,
+            "llm.model": "agent",
+            "timestamp": datetime.now(timezone.utc).isoformat()  # Update timestamp
+        }
+        
+        # Perform the update
+        result = messages.update_one(
+            {'message_id': latest_user_message['message_id']},
+            {'$set': update_data}
+        )
+        
+        if result.modified_count == 0:
+            return jsonify({"error": "Failed to update message with agent response"}), 500
+        
+        # Fetch the updated document
+        updated_message = messages.find_one({'message_id': latest_user_message['message_id']})
+        
+        # Update session with the message_id (if not already there)
+        sessions.update_one(
+            {"session_id": session_id},
+            {"$addToSet": {"message_ids": latest_user_message['message_id']}}
+        )
+        
+        # Emit to Socket.IO so frontend updates in real-time
+        socketio.emit("agent_message", serialize_doc(updated_message), room=session_id)
+        
+        # Also emit to agent's room for their dashboard
+        socketio.emit("agent_message_sent", serialize_doc(updated_message), room=f"agent_{agent_id}")
+        
+        publish_event(
+            body=serialize_doc(updated_message),
+            headers={"type": "agent.message.sent", "x-attempt": 0}
+        )
+        
+        return jsonify(serialize_doc(updated_message))
+        
+    except Exception as e:
+        print("Error in /agent/chat:", str(e))
+        print(traceback.format_exc())
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+@app.route("/session/<session_id>/status", methods=["GET"])
+def get_session_status(session_id):
+    try:
+        # Check if session is assigned to an agent
+        session = sessions.find_one({'session_id': session_id})
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+        
+        # Check Supabase for ticket assignment
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_KEY')
+        supabase_client = create_client(supabase_url, supabase_key)
+        
+        ticket_response = supabase_client.table('tickets') \
+            .select('*') \
+            .eq('sessionId', session_id) \
+            .execute()
+        
+        ticket = ticket_response.data[0] if ticket_response.data else None
+        
+        is_assigned = False
+        assigned_agent = None
+        agent_name = None
+        
+        if ticket and ticket.get('escalatedTo'):
+            is_assigned = True
+            assigned_agent = ticket.get('escalatedTo')
+            # Get agent name
+            agent = agents.find_one({'user_id': assigned_agent})
+            agent_name = agent.get('name') if agent else assigned_agent
+        
+        return jsonify({
+            "session_id": session_id,
+            "is_assigned_to_agent": is_assigned,
+            "assigned_agent": assigned_agent,
+            "assigned_agent_name": agent_name,
+            "is_active": ticket.get('isActive') if ticket else True
+        })
+        
+    except Exception as e:
+        print("Error in /session/status:", str(e))
+        return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 @app.route("/")
 def index():
@@ -522,6 +691,25 @@ def on_leave(data):
         leave_room(session_id)
         print(f"SocketIO client left room: {session_id}")
         emit("left", {"session_id": session_id})
+
+@socketio.on("agent_join")
+def on_agent_join(data):
+    agent_id = (data or {}).get("agent_id")
+    if not agent_id:
+        print("SocketIO agent_join failed: missing agent_id")
+        emit("error", {"msg": "agent_id required to join agent room"})
+        return
+    join_room(f"agent_{agent_id}")
+    print(f"Agent {agent_id} joined their room")
+    emit("agent_joined", {"agent_id": agent_id})
+
+@socketio.on("agent_leave")
+def on_agent_leave(data):
+    agent_id = (data or {}).get("agent_id")
+    if agent_id:
+        leave_room(f"agent_{agent_id}")
+        print(f"Agent {agent_id} left their room")
+        emit("agent_left", {"agent_id": agent_id})
 
 if __name__ == "__main__":
     socketio.run(app, port=5001, debug=True)
