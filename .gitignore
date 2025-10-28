@@ -1,0 +1,10 @@
+# Ignore virtual environments
+venv/
+.env/
+__pycache__/
+*.pyc
+
+# Common cache/build dirs
+.DS_Store
+*.log
+*.sqlite3
