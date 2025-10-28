@@ -22,8 +22,9 @@ setup_topology()
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "test-secret")
-CORS(app, resources={r"/*": {"origins": ["http://localhost:3000"]}}, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins=["http://localhost:3000"], cors_credentials=True, logger=True, engineio_logger=True)
+CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
+CORS(app, resources={r"/*": {"origins": [CORS_ALLOWED_ORIGINS]}}, supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins=[CORS_ALLOWED_ORIGINS], cors_credentials=True, logger=True, engineio_logger=True)
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 def parse_timestamp(ts):
