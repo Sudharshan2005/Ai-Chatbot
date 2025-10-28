@@ -1,12 +1,21 @@
-# Ignore virtual environments
+# Ignore all virtual environments
 venv/
-.env/
+app/venv/
+
+# Python cache and build
 __pycache__/
 *.pyc
-
-# Common cache/build dirs
-.DS_Store
+*.pyo
+*.pyd
 *.log
-*.sqlite3
 
-/app/venv/
+# Environment files
+.env
+*.env
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# OS files
+.DS_Store
