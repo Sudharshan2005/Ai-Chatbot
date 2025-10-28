@@ -13,12 +13,22 @@ from flask_cors import CORS
 import traceback
 from sentence_transformers import SentenceTransformer, util
 from supabase import create_client
+from huggingface_hub import hf_hub_download
 
 load_dotenv()
-df, X, embedding_model = joblib.load("../../chatbot.pkl")
+# df, X, embedding_model = joblib.load("../../chatbot.pkl")
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 bot = genai.GenerativeModel(model_name='models/gemini-2.5-flash')
 setup_topology()
+
+REPO_ID = "Sudharshan7781/Chatbot"
+FILENAME = "chatbot.pkl"
+
+MODEL_PATH = hf_hub_download(repo_id=REPO_ID, filename=FILENAME)
+
+print(f"Model downloaded to: {MODEL_PATH}")
+
+df, X, embedding_model = joblib.load(MODEL_PATH)
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "test-secret")
