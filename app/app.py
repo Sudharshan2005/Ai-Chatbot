@@ -16,25 +16,36 @@ from supabase import create_client
 from huggingface_hub import hf_hub_download
 
 load_dotenv()
-# df, X, embedding_model = joblib.load("../../chatbot.pkl")
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-bot = genai.GenerativeModel(model_name='models/gemini-2.5-flash')
-setup_topology()
 
-REPO_ID = "Sudharshan7781/Chatbot"
-FILENAME = "chatbot.pkl"
+# Load chatbot dataset model
+try:
+    df, X, embedding_model = joblib.load("/Users/sudharshan/Downloads/chatbot.pkl")
+    print("[OK] chatbot.pkl loaded")
+except Exception as e:
+    print(f"[WARN] chatbot.pkl failed to load: {e}. Dataset answers disabled.")
+    df, X, embedding_model = None, None, None
 
-MODEL_PATH = hf_hub_download(repo_id=REPO_ID, filename=FILENAME)
+# Configure Gemini
+try:
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    bot = genai.GenerativeModel(model_name='models/gemini-2.5-flash')
+    print("[OK] Gemini configured")
+except Exception as e:
+    print(f"[WARN] Gemini config failed: {e}")
+    bot = None
 
-print(f"Model downloaded to: {MODEL_PATH}")
-
-df, X, embedding_model = joblib.load(MODEL_PATH)
+# Setup RabbitMQ topology (non-fatal if unavailable)
+try:
+    setup_topology()
+    print("[OK] RabbitMQ topology ready")
+except Exception as e:
+    print(f"[WARN] RabbitMQ unavailable: {e}. Message queue disabled.")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "test-secret")
-CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
-CORS(app, resources={r"/*": {"origins": [CORS_ALLOWED_ORIGINS]}}, supports_credentials=True)
-socketio = SocketIO(app, cors_allowed_origins=[CORS_ALLOWED_ORIGINS], cors_credentials=True, logger=True, engineio_logger=True)
+CORS_ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000").split(",")]
+CORS(app, resources={r"/*": {"origins": CORS_ALLOWED_ORIGINS}}, supports_credentials=True)
+socketio = SocketIO(app, cors_allowed_origins=CORS_ALLOWED_ORIGINS, cors_credentials=True, logger=True, engineio_logger=True)
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 def parse_timestamp(ts):
@@ -82,12 +93,24 @@ def analyze_intent(query: str) -> str:
     else: return "other"
 
 def find_best_dataset_answer(query, threshold=0.85):
-    query_vec = embedding_model.encode([query])
-    sims = cosine_similarity(query_vec, X)[0]
-    best_idx = sims.argmax()
-    if sims[best_idx] >= threshold:
-        return df.iloc[best_idx]["cleaned_answer"]
+    if df is None or X is None:
+        return None
+    try:
+        # Use the freshly-loaded model instance (pkl model may be incompatible with current sentence-transformers version)
+        query_vec = model.encode([query])
+        sims = cosine_similarity(query_vec, X)[0]
+        best_idx = sims.argmax()
+        if sims[best_idx] >= threshold:
+            return df.iloc[best_idx]["cleaned_answer"]
+    except Exception as e:
+        print(f"[WARN] Dataset similarity search failed: {e}")
     return None
+
+def safe_publish(body, headers=None):
+    try:
+        publish_event(body=body, headers=headers or {})
+    except Exception as e:
+        print(f"[WARN] publish_event failed (RabbitMQ unavailable): {e}")
 
 @app.errorhandler(Exception)
 def handle_error(error):
@@ -114,17 +137,23 @@ def chat():
 
         print(f"Received message for session_id: {session_id}, user_id: {user_id}, message: {user_message}")
 
-        supabase_url = os.getenv('SUPABASE_URL')
-        supabase_key = os.getenv('SUPABASE_KEY')
-        supabase_client = create_client(supabase_url, supabase_key)
-        
-        ticket_response = supabase_client.table('tickets') \
-            .select('*') \
-            .eq('sessionId', session_id) \
-            .execute()
-        
-        ticket = ticket_response.data[0] if ticket_response.data else None
-        is_assigned_to_agent = ticket and ticket.get('escalatedTo') and ticket.get('isActive')
+        ticket = None
+        try:
+            supabase_url = os.getenv('SUPABASE_URL')
+            # Use service role key to bypass RLS on server-side lookups
+            supabase_key = os.getenv('SUPABASE_SERVICE_KEY') or os.getenv('SUPABASE_KEY')
+            supabase_client = create_client(supabase_url, supabase_key)
+            ticket_response = supabase_client.table('tickets') \
+                .select('*') \
+                .eq('sessionId', session_id) \
+                .execute()
+            ticket = ticket_response.data[0] if ticket_response.data else None
+            print(f"[DEBUG] Ticket lookup for {session_id}: {ticket}")
+        except Exception as sb_err:
+            print(f"[WARN] Supabase ticket lookup failed: {sb_err}")
+
+        is_active_ticket = ticket and ticket.get('isActive')
+        is_assigned_to_agent = is_active_ticket and ticket.get('escalatedTo')
 
         # Save message_id to sessions collection
         sessions.update_one(
@@ -138,6 +167,27 @@ def chat():
             },
             upsert=True
         )
+
+        if is_active_ticket and not is_assigned_to_agent:
+            # Ticket exists but no agent assigned yet — tell user to wait
+            waiting_doc = {
+                "org_id": org_id, "user_id": user_id, "channel": channel,
+                "session_id": session_id, "case_id": case_id, "message_id": message_id,
+                "parent_message_id": None, "request_id": request_id, "direction": "inbound",
+                "user_message": user_message,
+                "response": "Your request has been escalated. An agent will be assigned to assist you shortly. Please wait.",
+                "source": "system", "status": "open",
+                "nlu": {"intent": "other", "intent_confidence": 0.5, "language": "en", "sentiment": "neutral", "tone": "neutral"},
+                "retrieval": {"kb_id": "default", "top_k_doc_ids": [], "answer_confidence": 1.0, "similarity_score": 1.0},
+                "llm": {"model": None, "latency_ms": 0, "prompt_tokens": None, "completion_tokens": None},
+                "ticket": {"escalated": True, "ticket_id": None, "resolution_code": None},
+                "feedback": {"user_rating": None, "user_comment": None},
+                "security": {"pii_redacted": True, "pii_types": []},
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            save_message(waiting_doc)
+            socketio.emit("message:ack", serialize_doc(waiting_doc), room=session_id)
+            return jsonify(serialize_doc(waiting_doc))
 
         if is_assigned_to_agent:
             agent_id = ticket.get('escalatedTo')
@@ -160,23 +210,16 @@ def chat():
             }
             
             save_message(user_message_doc)
-            
-            # Emit to Socket.IO for real-time updates
-            socketio.emit("user_message", serialize_doc(user_message_doc), room=session_id)
+
             # Notify the assigned agent
             socketio.emit("new_user_message", serialize_doc(user_message_doc), room=f"agent_{agent_id}")
-            
-            publish_event(
+
+            safe_publish(
                 body=serialize_doc(user_message_doc),
                 headers={"type": "user.message.to.agent", "x-attempt": 0}
             )
-            
-            return jsonify({
-                "message": "Message forwarded to agent",
-                "assigned_agent": agent_id,
-                "user_message": user_message,
-                "session_id": session_id
-            })
+
+            return jsonify(serialize_doc(user_message_doc))
 
         # Load memory from Redis
         memory_data = load_redis_memory(user_id, session_id)
@@ -218,7 +261,7 @@ def chat():
                 }
                 save_message(doc)
                 save_redis_memory(user_id, session_id, memory)
-                publish_event(
+                safe_publish(
                     body=serialize_doc(doc),
                     headers={"type": "message.received", "x-attempt": 0}
                 )
@@ -228,7 +271,7 @@ def chat():
         # Try dataset answer
         ans = find_best_dataset_answer(user_message)
         if ans:
-            sim = float(cosine_similarity(embedding_model.encode([user_message]), X)[0].max())
+            sim = float(cosine_similarity(model.encode([user_message]), X)[0].max())
             memory.add_interaction(user_message, ans, intent)
             latency_ms = round((time.perf_counter() - t0) * 1000)
             doc = {
@@ -246,7 +289,7 @@ def chat():
             }
             save_message(doc)
             save_redis_memory(user_id, session_id, memory)
-            publish_event(
+            safe_publish(
                 body=serialize_doc(doc),
                 headers={"type": "message.received", "x-attempt": 0}
             )
@@ -254,9 +297,16 @@ def chat():
             return jsonify(serialize_doc(doc))
 
         # Generate response with Gemini
-        ctx = memory.get_context()
-        prompt = f"You are a helpful and friendly customer support chatbot. Your goal is to provide clear, concise, and accurate responses to user inquiries. Keep your answers short to medium in length. Your tone should be warm, empathetic, and non-judgmental. Here's the conversation so far: {ctx} New user message: {user_message} Craft a helpful response that addresses the user's message directly. Ensure your response is easy to understand and maintains a consistent, supportive tone."
-        resp_text = bot.generate_content(prompt).text.strip()
+        if bot is None:
+            resp_text = "I'm sorry, I'm unable to process your request right now. Please try again later or contact support directly."
+        else:
+            ctx = memory.get_context()
+            prompt = f"You are a helpful and friendly customer support chatbot. Your goal is to provide clear, concise, and accurate responses to user inquiries. Keep your answers short to medium in length. Your tone should be warm, empathetic, and non-judgmental. Here's the conversation so far: {ctx} New user message: {user_message} Craft a helpful response that addresses the user's message directly. Ensure your response is easy to understand and maintains a consistent, supportive tone."
+            try:
+                resp_text = bot.generate_content(prompt).text.strip()
+            except Exception as gemini_err:
+                print(f"[WARN] Gemini generation failed: {gemini_err}")
+                resp_text = "I'm sorry, I'm unable to process your request right now. Please try again later or contact support directly."
         memory.add_interaction(user_message, resp_text, intent)
         try:
             query_emb = model.encode([user_message], convert_to_tensor=True)
@@ -285,7 +335,7 @@ def chat():
         }
         save_message(doc)
         save_redis_memory(user_id, session_id, memory)
-        publish_event(
+        safe_publish(
             body=serialize_doc(doc),
             headers={"type": "message.received", "x-attempt": 0}
         )
@@ -561,67 +611,48 @@ def agent_chat():
         
         if not agent_id or not session_id:
             return jsonify({"error": "agent_id and session_id are required"}), 400
-        
-        # Verify agent has access to this session
-        agent = agents.find_one({'user_id': agent_id})
-        if not agent or session_id not in agent.get('current_sessions', []):
-            return jsonify({"error": "Agent not assigned to this session"}), 403
-        
-        # Verify session exists and is active
+
+        # Verify session exists
         session = sessions.find_one({'session_id': session_id})
         if not session:
             return jsonify({"error": "Session not found"}), 404
         
-        # Get the latest user message that's waiting for agent response
-        latest_user_message = messages.find_one({
-            'session_id': session_id,
-            'waiting_for_agent_response': True
-        }, sort=[('timestamp', -1)])  # Get the most recent one
-        
-        if not latest_user_message:
-            return jsonify({"error": "No user message found waiting for response"}), 404
-        
-        # Update the existing document with agent's response
-        update_data = {
+        # Store agent message as a new document
+        msg_id = str(uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        agent_doc = {
+            "message_id": msg_id,
+            "session_id": session_id,
+            "user_message": None,
             "response": user_message,
             "source": "agent",
-            "status": "resolved",
-            "waiting_for_agent_response": False,  # Remove the flag
+            "role": "assistant",
             "agent_id": agent_id,
-            "llm.model": "agent",
-            "timestamp": datetime.now(timezone.utc).isoformat()  # Update timestamp
+            "status": "resolved",
+            "waiting_for_agent_response": False,
+            "timestamp": now,
+            "direction": "outbound",
         }
-        
-        # Perform the update
-        result = messages.update_one(
-            {'message_id': latest_user_message['message_id']},
-            {'$set': update_data}
-        )
-        
-        if result.modified_count == 0:
-            return jsonify({"error": "Failed to update message with agent response"}), 500
-        
-        # Fetch the updated document
-        updated_message = messages.find_one({'message_id': latest_user_message['message_id']})
-        
-        # Update session with the message_id (if not already there)
+        messages.insert_one(agent_doc)
+
         sessions.update_one(
             {"session_id": session_id},
-            {"$addToSet": {"message_ids": latest_user_message['message_id']}}
+            {"$addToSet": {"message_ids": msg_id}}
         )
-        
-        # Emit to Socket.IO so frontend updates in real-time
-        socketio.emit("agent_message", serialize_doc(updated_message), room=session_id)
-        
-        # Also emit to agent's room for their dashboard
-        socketio.emit("agent_message_sent", serialize_doc(updated_message), room=f"agent_{agent_id}")
-        
-        publish_event(
-            body=serialize_doc(updated_message),
+
+        payload = serialize_doc(agent_doc)
+
+        # Emit to user's session room so their chat updates live
+        socketio.emit("agent_message", payload, room=session_id)
+        # Emit back to agent dashboard room
+        socketio.emit("agent_message_sent", payload, room=f"agent_{agent_id}")
+
+        safe_publish(
+            body=payload,
             headers={"type": "agent.message.sent", "x-attempt": 0}
         )
-        
-        return jsonify(serialize_doc(updated_message))
+
+        return jsonify(payload)
         
     except Exception as e:
         print("Error in /agent/chat:", str(e))
@@ -723,4 +754,4 @@ def on_agent_leave(data):
         emit("agent_left", {"agent_id": agent_id})
 
 if __name__ == "__main__":
-    socketio.run(app, port=5001, debug=True)
+    socketio.run(app, port=5001, debug=True, allow_unsafe_werkzeug=True)

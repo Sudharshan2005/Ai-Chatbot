@@ -21,7 +21,10 @@ def get_connection():
     return pika.BlockingConnection(_params())
 
 def setup_topology():
-    conn = get_connection()
+    # Use a single fast attempt (not the retrying get_connection) so startup doesn't block
+    if not AMQP_URL:
+        raise ValueError("AMQP_URL not set")
+    conn = pika.BlockingConnection(pika.URLParameters(AMQP_URL))
     ch = conn.channel()
 
     ch.exchange_declare(exchange=EXCHANGE_NAME, exchange_type=EXCHANGE_TYPE, durable=True)
